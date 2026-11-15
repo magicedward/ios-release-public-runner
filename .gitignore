@@ -7,3 +7,4 @@
 *.zip
 release.config.json
 private_keys/
+.github_token

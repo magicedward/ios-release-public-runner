@@ -133,6 +133,15 @@ jobs:
           CERT_NAME: ${{ secrets.CERT_NAME }}
         run: bash scripts/ios-release/ci-sign.sh work/app.ipa "$SIGN_MODE"
 
+      - name: 回传重签产物（供下载验证）
+        if: inputs.sign_mode == 'resign' && success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-resigned-${{ github.run_id }}
+          path: ${{ github.workspace }}/work/app.ipa
+          retention-days: 7
+          if-no-files-found: error
+
       - name: 上传到 TestFlight / App Store Connect
         if: inputs.upload_mode == 'upload'
         uses: apple-actions/upload-testflight-build@v5
@@ -169,7 +178,8 @@ jobs:
           set +e
           T="${RUNNER_TEMP:-/tmp}"
           rm -f "$T/cert.p12" "$T/profile.mobileprovision" "$T/profile.plist" \
-                "$T/entitlements.plist" "$T/ent.tmp.plist" "$T/sign-order.txt"
+                "$T/entitlements.plist" "$T/ent.tmp.plist" "$T/ent.old.plist" \
+                "$T/ipa-tops.txt" "$T/sign-order.bin" "$T/app-resigned.ipa"
           if command -v security >/dev/null 2>&1; then
             [ -f "$T/ios-sign.keychain-db" ] && \
               security delete-keychain "$T/ios-sign.keychain-db" >/dev/null 2>&1

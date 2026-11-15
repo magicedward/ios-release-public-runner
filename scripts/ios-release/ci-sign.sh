@@ -14,7 +14,8 @@ EXPECTED_BUNDLE_ID="${EXPECTED_BUNDLE_ID:-com.jieli.bmstool}"
 export EXPECTED_BUNDLE_ID
 
 cleanup() {
-  rm -f "$T/cert.p12" "$T/profile.mobileprovision" "$T/ent.tmp.plist" "$T/sign-order.bin"
+  rm -f "$T/cert.p12" "$T/profile.mobileprovision" "$T/ent.tmp.plist" \
+        "$T/ent.old.plist" "$T/ipa-tops.txt" "$T/sign-order.bin"
 }
 trap cleanup EXIT
 
@@ -167,6 +168,14 @@ resign_macos() {
   UUID="$("$PY" -c 'import plistlib,sys;r=open(sys.argv[1],"rb").read();i=r.find(b"<?xml");print(plistlib.loads(r[i:] if i>=0 else r)["UUID"])' "$T/profile.plist")"
   cp "$T/profile.mobileprovision" "$HOME/Library/MobileDevice/Provisioning Profiles/$UUID.mobileprovision"
 
+  # 记录原 IPA 的顶层条目，重打包后逐一比对（防止丢 SwiftSupport 等）
+  "$PY" - "$IPA" "$T/ipa-tops.txt" <<'PY'
+import zipfile, sys
+z = zipfile.ZipFile(sys.argv[1])
+tops = sorted({n.split("/")[0] for n in z.namelist()
+               if n.split("/")[0] and not n.startswith("__MACOSX")})
+open(sys.argv[2], "w").write("\n".join(tops))
+PY
   rm -rf "$WORK/unpack"
   mkdir -p "$WORK/unpack"
   unzip -q "$IPA" -d "$WORK/unpack"
@@ -174,13 +183,46 @@ resign_macos() {
   APP="$(find "$WORK/unpack/Payload" -maxdepth 1 -type d -name '*.app' | head -1)"
   [ -n "$APP" ] || fail "解包后找不到 Payload/*.app"
 
-  # 保留原有 entitlements（微信 SDK 的 keychain-access-groups / associated-domains 等不能丢）
+  # 主 App 的 entitlements 以「新描述文件」为基准重建：
+  #   原签名里的 application-identifier / team-identifier / get-task-allow 带旧 Team，
+  #   沿用会出现 ITMS-90163 或装不上；SDK 依赖但 profile 未声明的能力键才从旧签名补齐。
   local ENT="$T/entitlements.plist"
-  if ! codesign -d --entitlements :- --xml "$APP" > "$ENT" 2>/dev/null \
-     || ! "$PY" -c 'import plistlib,sys;plistlib.load(open(sys.argv[1],"rb"))' "$ENT" 2>/dev/null; then
-    "$PY" -c 'import plistlib,sys;r=open(sys.argv[1],"rb").read();i=r.find(b"<?xml");p=plistlib.loads(r[i:] if i>=0 else r);plistlib.dump(p.get("Entitlements",{}),open(sys.argv[2],"wb"))' \
-      "$T/profile.plist" "$ENT"
-  fi
+  local OLD_ENT="$T/ent.old.plist"
+  : > "$OLD_ENT"
+  codesign -d --entitlements :- --xml "$APP" > "$OLD_ENT" 2>/dev/null || true
+  "$PY" - "$T/profile.plist" "$OLD_ENT" "$ENT" <<'PY'
+import plistlib, sys
+
+def load(path):
+    try:
+        return plistlib.load(open(path, "rb"))
+    except Exception:
+        return {}
+
+prof = load(sys.argv[1]).get("Entitlements", {})
+old = load(sys.argv[2])
+merged = dict(prof)
+forced = ("application-identifier", "com.apple.developer.team-identifier",
+          "get-task-allow", "beta-reports-active")
+for k in forced:
+    if k in prof:
+        merged[k] = prof[k]
+# 只补齐白名单内的 SDK 能力键，避免把 aps-environment=development 之类脏值带进去
+keep = ("keychain-access-groups", "com.apple.developer.associated-domains",
+        "com.apple.developer.networking.wifi-info",
+        "com.apple.external-accessory.wireless-configuration")
+for k in keep:
+    if k in old and k not in merged:
+        merged[k] = old[k]
+plistlib.dump(merged, open(sys.argv[3], "wb"))
+aid = str(merged.get("application-identifier", ""))
+team = str(merged.get("com.apple.developer.team-identifier", ""))
+if not aid or not team or aid.split(".")[0] != team:
+    print("::error::描述文件的 application-identifier 与 Team ID 不一致: %s / %s" % (aid, team))
+    sys.exit(1)
+print("::notice::entitlements 已按新 profile 重建: %s / get-task-allow=%s / 键数=%d"
+      % (aid, merged.get("get-task-allow"), len(merged)))
+PY
 
   # 换成 Secrets 中的描述文件（须在主 App 签名之前）
   cp "$T/profile.mobileprovision" "$APP/embedded.mobileprovision"
@@ -227,11 +269,27 @@ PY
   codesign --verify --deep --strict --verbose=2 "$APP" 2>&1 | tail -10
   note "重签完成: $CERT / profile $UUID"
 
-  # -y 保留 framework 内的符号链接
-  find "$WORK/unpack/Payload" -name '.DS_Store' -delete 2>/dev/null || true
+  # -y 保留 framework 内符号链接；必须打包全部顶层条目
+  # （实测原 IPA 含 SwiftSupport/iphoneos/libswift_Concurrency.dylib，只打 Payload 会丢 Swift 运行时）
+  find "$WORK/unpack" -name '.DS_Store' -delete 2>/dev/null || true
   local NEW="$T/app-resigned.ipa"
   rm -f "$NEW"
-  ( cd "$WORK/unpack" && zip -qry "$NEW" Payload )
+  ( cd "$WORK/unpack" && zip -qry "$NEW" * )
+  "$PY" - "$NEW" "$T/ipa-tops.txt" <<'PY'
+import sys, zipfile
+z = zipfile.ZipFile(sys.argv[1])
+tops = sorted({n.split("/")[0] for n in z.namelist()
+               if n.split("/")[0] and not n.startswith("__MACOSX")})
+want = open(sys.argv[2]).read().splitlines()
+missing = [t for t in want if t not in tops]
+print("::notice::重打包顶层条目: %s" % ", ".join(tops))
+if z.testzip():
+    print("::error::重打包后的 IPA ZIP 损坏")
+    sys.exit(1)
+if missing:
+    print("::error::重打包丢失顶层条目: %s" % ", ".join(missing))
+    sys.exit(1)
+PY
   mv "$NEW" "$IPA"
 }
 
