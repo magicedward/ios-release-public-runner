@@ -1,0 +1,9 @@
+# 空壳公仓：只允许 CI 文件，禁止源码 / 证书 / IPA 入库
+*.ipa
+*.p12
+*.key
+*.p8
+*.mobileprovision
+*.zip
+release.config.json
+private_keys/

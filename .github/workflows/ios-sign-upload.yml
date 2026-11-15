@@ -1,0 +1,178 @@
+name: iOS IPA 签名校验与上传（替代本地 Mac）
+
+# 设计要点（对照旧的 Win11 + 局域网 Mac 流程）：
+#   1. 微信 Donut 云构建产出的 IPA 已经带分发签名，CI 默认只做「验签」；
+#      确需在 CI 重签时把 sign_mode 设为 resign（p12 / 描述文件走 Secrets）。
+#   2. 上传走 App Store Connect Build Uploads API（apple-actions/upload-testflight-build@v5
+#      的 backend: appstore-api），不需要 AppStoreInfo.plist、不需要 xcrun swinfo、
+#      不需要 iTMSTransporter，也不受国内到 Apple 的网络波动影响。
+#      → 那台 2015 MacBook Pro（Xcode 14.2 / SSH / swinfo）彻底退役。
+#   3. sign_mode=verify 时可把 runner 切到 ubuntu-latest：上传不依赖 macOS，
+#      私有仓库计费倍率从 10x 降到 1x。resign 必须用 macOS。
+
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_source:
+        description: 'IPA 来源：release=本仓库 Release asset；url=可下载直链'
+        type: choice
+        required: true
+        default: 'release'
+        options: [release, url]
+      release_tag:
+        description: 'Release tag（release 模式必填，例如 ipa-1.0.6-6）'
+        required: false
+        default: ''
+      ipa_asset:
+        description: 'Release 中的 IPA 文件名（支持通配符）'
+        required: false
+        default: '*.ipa'
+      ipa_url:
+        description: 'IPA 直链（url 模式必填）'
+        required: false
+        default: ''
+      sign_mode:
+        description: 'verify=仅验签（推荐）；resign=用 Secrets 中的 p12/描述文件重签'
+        type: choice
+        required: true
+        default: 'verify'
+        options: [verify, resign]
+      runner:
+        description: 'runner（resign 必须 macOS；verify 可用 ubuntu 省 10 倍额度）'
+        type: choice
+        required: true
+        default: 'macos-15'
+        options: ['macos-15', 'macos-15-intel', 'ubuntu-latest']
+      upload_mode:
+        description: 'upload=上传到 TestFlight；dry-run=只校验/签名不上传（首次建议先跑这个）'
+        type: choice
+        required: true
+        default: 'dry-run'
+        options: ['dry-run', 'upload']
+      backend:
+        description: '上传后端；appstore-api 无需 plist/Transporter，altool 需 Xcode（仅 macOS）'
+        type: choice
+        required: true
+        default: 'appstore-api'
+        options: ['appstore-api', 'altool']
+      wait_processing:
+        description: '等待 Apple 处理完成并回读状态（需先在 ASC 补齐 TestFlight 测试信息）'
+        type: choice
+        required: true
+        default: 'false'
+        options: ['false', 'true']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-release-${{ inputs.release_tag }}
+  cancel-in-progress: false
+
+jobs:
+  sign-upload:
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 30
+    env:
+      IPA_SOURCE: ${{ inputs.ipa_source }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      IPA_ASSET: ${{ inputs.ipa_asset }}
+      IPA_URL: ${{ inputs.ipa_url }}
+      SIGN_MODE: ${{ inputs.sign_mode }}
+      EXPECTED_BUNDLE_ID: com.jieli.bmstool
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 前置守卫
+        env:
+          RUNNER_OS: ${{ runner.os }}
+          UPLOAD_BACKEND: ${{ inputs.backend }}
+        run: |
+          set -euo pipefail
+          if [ "$SIGN_MODE" = "resign" ] && [ "$RUNNER_OS" != "macOS" ]; then
+            echo "::error::resign 需要 codesign / security，必须在 macOS runner 上执行"
+            exit 1
+          fi
+          if [ "$UPLOAD_BACKEND" = "altool" ] && [ "$RUNNER_OS" != "macOS" ]; then
+            echo "::error::altool 后端需要 Xcode，必须在 macOS runner 上执行"
+            exit 1
+          fi
+          if [ "${{ inputs.upload_mode }}" = "upload" ]; then
+            echo "::notice::本步骤将把 IPA 上传到 App Store Connect（对外动作）"
+          else
+            echo "::notice::dry-run：只做校验/签名，不会上传"
+          fi
+
+      - name: 获取 IPA
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          if [ "$IPA_SOURCE" = "release" ]; then
+            [ -n "$RELEASE_TAG" ] || { echo "::error::release_tag 为空"; exit 1; }
+            gh release download "$RELEASE_TAG" \
+              --repo "${{ github.repository }}" \
+              --pattern "$IPA_ASSET" --dir work --clobber
+          else
+            [ -n "$IPA_URL" ] || { echo "::error::ipa_url 为空"; exit 1; }
+            curl -fL --retry 3 --connect-timeout 20 -o work/input.ipa "$IPA_URL"
+          fi
+          IPA="$(find work -maxdepth 1 -type f -iname '*.ipa' | head -1)"
+          [ -n "$IPA" ] || { echo "::error::未找到 IPA"; exit 1; }
+          mv "$IPA" work/app.ipa
+          ls -lh work/app.ipa
+          unzip -t work/app.ipa | tail -2
+
+      - name: 验签 / 重签
+        env:
+          # resign 模式才需要下面 4 项；verify 模式留空即可
+          P12_BASE64: ${{ secrets.P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+          MOBILEPROVISION_BASE64: ${{ secrets.MOBILEPROVISION_BASE64 }}
+          CERT_NAME: ${{ secrets.CERT_NAME }}
+        run: bash scripts/ios-release/ci-sign.sh work/app.ipa "$SIGN_MODE"
+
+      - name: 上传到 TestFlight / App Store Connect
+        if: inputs.upload_mode == 'upload'
+        uses: apple-actions/upload-testflight-build@v5
+        with:
+          app-path: ${{ github.workspace }}/work/app.ipa
+          app-type: ios
+          issuer-id: ${{ secrets.ASC_ISSUER_ID }}
+          api-key-id: ${{ secrets.ASC_KEY_ID }}
+          api-private-key: ${{ secrets.ASC_P8 }}
+          backend: ${{ inputs.backend }}
+          # 与 Info.plist 的 ITSAppUsesNonExemptEncryption=false 保持一致，规避出口合规问卷
+          uses-non-exempt-encryption: 'false'
+          wait-for-processing: ${{ inputs.wait_processing }}
+
+      - name: 结果摘要
+        if: always()
+        env:
+          UPLOAD_MODE: ${{ inputs.upload_mode }}
+        run: |
+          {
+            echo "## iOS 发布结果"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "| --- | --- |"
+            echo "| IPA 来源 | \`$IPA_SOURCE\` / \`$RELEASE_TAG\` |"
+            echo "| 签名模式 | \`$SIGN_MODE\` |"
+            echo "| Runner | \`${{ runner.os }}\` |"
+            echo "| 上传 | \`$UPLOAD_MODE\` / \`${{ inputs.backend }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 清理临时凭据（无论成败）
+        if: always()
+        run: |
+          set +e
+          T="${RUNNER_TEMP:-/tmp}"
+          rm -f "$T/cert.p12" "$T/profile.mobileprovision" "$T/profile.plist" \
+                "$T/entitlements.plist" "$T/ent.tmp.plist" "$T/sign-order.txt"
+          if command -v security >/dev/null 2>&1; then
+            [ -f "$T/ios-sign.keychain-db" ] && \
+              security delete-keychain "$T/ios-sign.keychain-db" >/dev/null 2>&1
+          fi
+          rm -rf "${{ github.workspace }}/work/unpack"
+          exit 0

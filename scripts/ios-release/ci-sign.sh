@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+# GitHub Actions runner 上校验 / 重签微信 Donut 云构建产出的 IPA。
+# 用法: ci-sign.sh <ipa> <verify|resign>
+# 说明: 云构建时已用 p12 + mobileprovision 签过名，默认只验签；resign 才会用 Secrets 重签。
+set -euo pipefail
+
+IPA="${1:?usage: ci-sign.sh <ipa> <verify|resign>}"
+MODE="${2:-verify}"
+PY="$(command -v python3 || command -v python)"
+[ -n "$PY" ] || { echo "::error::需要 python3 或 python"; exit 1; }
+T="${RUNNER_TEMP:-/tmp}"
+WORK="$T/ipa-work"
+EXPECTED_BUNDLE_ID="${EXPECTED_BUNDLE_ID:-com.jieli.bmstool}"
+export EXPECTED_BUNDLE_ID
+
+cleanup() {
+  rm -f "$T/cert.p12" "$T/profile.mobileprovision" "$T/ent.tmp.plist" "$T/sign-order.bin"
+}
+trap cleanup EXIT
+
+fail() { echo "::error::$*" >&2; exit 1; }
+note() { echo "::notice::$*"; }
+
+# ---------- 通用结构校验（macOS / Linux 均可） ----------
+inspect() {
+"$PY" - "$IPA" <<'PY'
+import os, sys, zipfile, plistlib
+ipa = sys.argv[1]
+expected = os.environ.get("EXPECTED_BUNDLE_ID", "com.jieli.bmstool")
+rows, fails = [], []
+with zipfile.ZipFile(ipa) as z:
+    bad = z.testzip()
+    if bad:
+        fails.append("ZIP 损坏: %s" % bad)
+    names = z.namelist()
+    infos = [n for n in names
+             if n.startswith("Payload/") and n.endswith(".app/Info.plist") and n.count("/") == 2]
+    if len(infos) != 1:
+        fails.append("Payload 下 .app/Info.plist 数量异常: %d" % len(infos))
+        info, app = {}, None
+    else:
+        app = infos[0][:-len("Info.plist")]
+        info = plistlib.loads(z.read(infos[0]))
+        rows.append(("App 路径", app.rstrip("/")))
+        for key, label in (("CFBundleIdentifier", "Bundle ID"),
+                           ("CFBundleShortVersionString", "版本"),
+                           ("CFBundleVersion", "Build 号"),
+                           ("MinimumOSVersion", "最低系统")):
+            rows.append((label, str(info.get(key, "<缺失>"))))
+        if info.get("CFBundleIdentifier") != expected:
+            fails.append("Bundle ID 不符: %s != %s" % (info.get("CFBundleIdentifier"), expected))
+        rows.append(("出口合规 ITSAppUsesNonExemptEncryption",
+                     str(info.get("ITSAppUsesNonExemptEncryption", "<未设置>"))))
+        usages = {k: v for k, v in info.items() if k.startswith("NS") and k.endswith("UsageDescription")}
+        rows.append(("权限描述键数量", str(len(usages))))
+        bad_desc = [k for k, v in usages.items()
+                    if any(ord(c) > 127 for c in str(v)) or "Demo" in str(v) or "请前往" in str(v)]
+        if bad_desc:
+            fails.append("权限文案含中文模板/Demo: %s" % ", ".join(bad_desc))
+        for rel, label, required in (("embedded.mobileprovision", "分发描述文件", True),
+                                     ("_CodeSignature/CodeResources", "签名资源", True)):
+            ok = (app + rel) in names
+            rows.append((label, "存在" if ok else "缺失"))
+            if required and not ok:
+                fails.append("%s 缺失" % label)
+
+lines = ["### IPA 结构校验", "", "| 项 | 值 |", "| --- | --- |"]
+lines += ["| %s | %s |" % (k, str(v).replace("|", "\\|")) for k, v in rows]
+lines += ["", "- 失败项：**%d**" % len(fails)]
+if fails:
+    lines += ["- " + f for f in fails]
+out = "\n".join(lines) + "\n"
+print(out)
+summary = os.environ.get("GITHUB_STEP_SUMMARY")
+if summary:
+    with open(summary, "a", encoding="utf-8") as f:
+        f.write(out)
+if fails:
+    for f in fails:
+        print("::error::" + f)
+    sys.exit(1)
+PY
+}
+
+# ---------- macOS 专项：codesign 验签 + 描述文件解析 ----------
+verify_macos() {
+  local APP="$1"
+  codesign --verify --deep --strict --verbose=2 "$APP" 2>&1 | tail -20
+  codesign -dv --verbose=4 "$APP" 2>&1 | grep -E 'Identifier=|Authority=|TeamIdentifier=|Signature=' || true
+  security cms -D -i "$APP/embedded.mobileprovision" > "$T/profile.plist"
+"$PY" - "$T/profile.plist" <<'PY'
+import os, sys, plistlib, datetime
+raw = open(sys.argv[1], "rb").read()
+i = raw.find(b"<?xml")
+if i < 0:
+    i = raw.find(b"bplist00")
+p = plistlib.loads(raw[i:] if i >= 0 else raw)
+rows, fails = [], []
+rows.append(("Profile 名称", p.get("Name", "<缺失>")))
+rows.append(("Profile UUID", p.get("UUID", "<缺失>")))
+rows.append(("TeamIdentifier", ", ".join(p.get("TeamIdentifier", []))))
+exp = p.get("ExpirationDate")
+now = datetime.datetime.now(datetime.timezone.utc)
+if isinstance(exp, datetime.datetime):
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=datetime.timezone.utc)
+    rows.append(("Profile 到期", exp.isoformat()))
+    if exp <= now:
+        fails.append("分发描述文件已过期: %s" % exp.isoformat())
+else:
+    fails.append("读取不到 ExpirationDate")
+gta = p.get("Entitlements", {}).get("get-task-allow")
+rows.append(("get-task-allow", str(gta)))
+if gta is not False:
+    fails.append("get-task-allow 应为 false（必须是 App Store 分发签名），实际为 %s" % gta)
+prov_bid = p.get("Entitlements", {}).get("application-identifier", "")
+rows.append(("application-identifier", prov_bid))
+out = "\n".join(["### 签名 / 描述文件校验", "", "| 项 | 值 |", "| --- | --- |"] +
+                ["| %s | %s |" % (k, str(v).replace("|", "\\|")) for k, v in rows] +
+                ["", "- 失败项：**%d**" % len(fails)] + ["- " + f for f in fails]) + "\n"
+print(out)
+summary = os.environ.get("GITHUB_STEP_SUMMARY")
+if summary:
+    with open(summary, "a", encoding="utf-8") as f:
+        f.write(out)
+for f in fails:
+    print("::error::" + f)
+sys.exit(1 if fails else 0)
+PY
+}
+
+# ---------- macOS 专项：用 Secrets 中的证书重签 ----------
+resign_macos() {
+  [ -n "${P12_BASE64:-}" ] || fail "resign 需要 Secret: P12_BASE64"
+  [ -n "${P12_PASSWORD:-}" ] || fail "resign 需要 Secret: P12_PASSWORD"
+  [ -n "${MOBILEPROVISION_BASE64:-}" ] || fail "resign 需要 Secret: MOBILEPROVISION_BASE64"
+
+  local KEYCHAIN="$T/ios-sign.keychain-db"
+  local KP
+  KP="$("$PY" -c 'import secrets;print(secrets.token_urlsafe(24))')"
+
+  "$PY" -c 'import base64,os,sys;open(sys.argv[1],"wb").write(base64.b64decode(os.environ["P12_BASE64"]))' "$T/cert.p12"
+  "$PY" -c 'import base64,os,sys;open(sys.argv[1],"wb").write(base64.b64decode(os.environ["MOBILEPROVISION_BASE64"]))' "$T/profile.mobileprovision"
+  chmod 600 "$T/cert.p12" "$T/profile.mobileprovision"
+
+  security create-keychain -p "$KP" "$KEYCHAIN"
+  security set-keychain-settings -lut 3600 "$KEYCHAIN"
+  security unlock-keychain -p "$KP" "$KEYCHAIN"
+  security import "$T/cert.p12" -k "$KEYCHAIN" -P "$P12_PASSWORD" -T /usr/bin/codesign -A
+  security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KP" "$KEYCHAIN" >/dev/null
+  local EXISTING
+  EXISTING="$(security list-keychains -d user | tr -d '"' | tr '\n' ' ')"
+  security list-keychains -d user -s "$KEYCHAIN" $EXISTING
+
+  local CERT="${CERT_NAME:-}"
+  if [ -z "$CERT" ]; then
+    CERT="$(security find-identity -v -p codesigning "$KEYCHAIN" \
+            | sed -n 's/.*"\(Apple Distribution:.*\)"/\1/p; s/.*"\(iPhone Distribution:.*\)"/\1/p' | head -1)"
+  fi
+  [ -n "$CERT" ] || fail "在 p12 中找不到分发证书，请显式设置 Secret: CERT_NAME"
+  note "签名身份: $CERT"
+
+  # 安装描述文件到 runner（Xcode/ASC 校验时会用到）
+  mkdir -p "$HOME/Library/MobileDevice/Provisioning Profiles"
+  security cms -D -i "$T/profile.mobileprovision" > "$T/profile.plist"
+  local UUID
+  UUID="$("$PY" -c 'import plistlib,sys;r=open(sys.argv[1],"rb").read();i=r.find(b"<?xml");print(plistlib.loads(r[i:] if i>=0 else r)["UUID"])' "$T/profile.plist")"
+  cp "$T/profile.mobileprovision" "$HOME/Library/MobileDevice/Provisioning Profiles/$UUID.mobileprovision"
+
+  rm -rf "$WORK/unpack"
+  mkdir -p "$WORK/unpack"
+  unzip -q "$IPA" -d "$WORK/unpack"
+  local APP
+  APP="$(find "$WORK/unpack/Payload" -maxdepth 1 -type d -name '*.app' | head -1)"
+  [ -n "$APP" ] || fail "解包后找不到 Payload/*.app"
+
+  # 保留原有 entitlements（微信 SDK 的 keychain-access-groups / associated-domains 等不能丢）
+  local ENT="$T/entitlements.plist"
+  if ! codesign -d --entitlements :- --xml "$APP" > "$ENT" 2>/dev/null \
+     || ! "$PY" -c 'import plistlib,sys;plistlib.load(open(sys.argv[1],"rb"))' "$ENT" 2>/dev/null; then
+    "$PY" -c 'import plistlib,sys;r=open(sys.argv[1],"rb").read();i=r.find(b"<?xml");p=plistlib.loads(r[i:] if i>=0 else r);plistlib.dump(p.get("Entitlements",{}),open(sys.argv[2],"wb"))' \
+      "$T/profile.plist" "$ENT"
+  fi
+
+  # 换成 Secrets 中的描述文件（须在主 App 签名之前）
+  cp "$T/profile.mobileprovision" "$APP/embedded.mobileprovision"
+
+  # 嵌套代码按路径深度倒序签名；dylib/framework 一律不带 entitlements
+  # （微信云端打包给 Swift dylib 误加 entitlements 会导致 ITMS-91166，重签可顺带消除）
+  "$PY" - "$WORK/unpack/Payload" "$T/sign-order.bin" "$APP" <<'PY'
+import os, sys
+root, out, main_app = sys.argv[1], sys.argv[2], os.path.abspath(sys.argv[3])
+items = []
+for dp, dn, fn in os.walk(root):
+    for n in dn:
+        if n.endswith((".framework", ".appex", ".app", ".xctest")):
+            items.append(os.path.join(dp, n))
+    for n in fn:
+        if n.endswith((".dylib", ".so")):
+            items.append(os.path.join(dp, n))
+items = [p for p in items if os.path.abspath(p) != main_app]
+items.sort(key=lambda p: (p.count(os.sep), len(p)), reverse=True)
+open(out, "wb").write(b"\0".join(p.encode() for p in items) + b"\0")
+PY
+
+  local item ent_file
+  while IFS= read -r -d '' item; do
+    [ -n "$item" ] || continue
+    ent_file=""
+    case "$item" in
+      *.appex|*.app|*.xctest)
+        if codesign -d --entitlements :- --xml "$item" > "$T/ent.tmp.plist" 2>/dev/null \
+           && [ -s "$T/ent.tmp.plist" ]; then
+          ent_file="$T/ent.tmp.plist"
+        fi
+        ;;
+    esac
+    if [ -n "$ent_file" ]; then
+      codesign --force --sign "$CERT" --keychain "$KEYCHAIN" --entitlements "$ent_file" "$item"
+    else
+      codesign --force --sign "$CERT" --keychain "$KEYCHAIN" "$item"
+    fi
+  done < "$T/sign-order.bin"
+
+  # 主 App 最后签
+  codesign --force --sign "$CERT" --keychain "$KEYCHAIN" --entitlements "$ENT" "$APP"
+  codesign --verify --deep --strict --verbose=2 "$APP" 2>&1 | tail -10
+  note "重签完成: $CERT / profile $UUID"
+
+  # -y 保留 framework 内的符号链接
+  find "$WORK/unpack/Payload" -name '.DS_Store' -delete 2>/dev/null || true
+  local NEW="$T/app-resigned.ipa"
+  rm -f "$NEW"
+  ( cd "$WORK/unpack" && zip -qry "$NEW" Payload )
+  mv "$NEW" "$IPA"
+}
+
+# ---------- 主流程 ----------
+[ -f "$IPA" ] || fail "IPA 不存在: $IPA"
+[ "$(uname -s)" = "Darwin" ] && IS_MAC=1 || IS_MAC=0
+
+inspect
+
+APP_DIR=""
+if [ "$IS_MAC" = "1" ]; then
+  rm -rf "$WORK/unpack"
+  mkdir -p "$WORK/unpack"
+  unzip -q "$IPA" -d "$WORK/unpack"
+  APP_DIR="$(find "$WORK/unpack/Payload" -maxdepth 1 -type d -name '*.app' | head -1)"
+  [ -n "$APP_DIR" ] || fail "解包后找不到 Payload/*.app"
+fi
+
+case "$MODE" in
+  verify)
+    note "模式 verify：只验签，不改动 IPA（云构建产物已带分发签名）"
+    if [ "$IS_MAC" = "1" ]; then verify_macos "$APP_DIR"; else
+      note "Linux runner：跳过 codesign / mobileprovision 深度校验（结构与版本已校验）"
+    fi
+    ;;
+  resign)
+    [ "$IS_MAC" = "1" ] || fail "resign 只能在 macOS runner 上执行"
+    resign_macos
+    inspect
+    verify_macos "$APP_DIR"
+    note "重签后 IPA 大小: $(wc -c < "$IPA") bytes"
+    ;;
+  *)
+    fail "未知模式: $MODE（只能是 verify 或 resign）"
+    ;;
+esac
+
+note "完成: $IPA ($MODE)"
