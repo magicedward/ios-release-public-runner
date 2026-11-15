@@ -12,6 +12,11 @@ T="${RUNNER_TEMP:-/tmp}"
 WORK="$T/ipa-work"
 EXPECTED_BUNDLE_ID="${EXPECTED_BUNDLE_ID:-com.jieli.bmstool}"
 export EXPECTED_BUNDLE_ID
+# Apple 自 2027-04 起要求上传到 App Store Connect 的 iOS/iPadOS App 部署目标 >= 15.0。
+# 微信 Donut 云构建未暴露 iOS deployment target 配置（产物默认 13.0），
+# 故在 resign 时把主 App Info.plist 的 MinimumOSVersion 提升到该值，再整体重新签名。
+MIN_OS_VERSION="${MIN_OS_VERSION:-15.0}"
+export MIN_OS_VERSION
 
 cleanup() {
   rm -f "$T/cert.p12" "$T/profile.mobileprovision" "$T/ent.tmp.plist" \
@@ -48,6 +53,15 @@ with zipfile.ZipFile(ipa) as z:
                            ("CFBundleVersion", "Build 号"),
                            ("MinimumOSVersion", "最低系统")):
             rows.append((label, str(info.get(key, "<缺失>"))))
+        min_req = os.environ.get("MIN_OS_VERSION", "15.0")
+        try:
+            def vnum(s):
+                return tuple(int(x) for x in str(s).split("."))
+            if vnum(info.get("MinimumOSVersion", "0")) < vnum(min_req):
+                rows.append(("部署目标提示", "当前 %s 低于要求 %s，resign 将自动提升"
+                             % (info.get("MinimumOSVersion"), min_req)))
+        except ValueError:
+            pass
         if info.get("CFBundleIdentifier") != expected:
             fails.append("Bundle ID 不符: %s != %s" % (info.get("CFBundleIdentifier"), expected))
         rows.append(("出口合规 ITSAppUsesNonExemptEncryption",
@@ -183,6 +197,22 @@ PY
   APP="$(find "$WORK/unpack/Payload" -maxdepth 1 -type d -name '*.app' | head -1)"
   [ -n "$APP" ] || fail "解包后找不到 Payload/*.app"
 
+  # 提升最低部署系统：保留原 plist 格式（二进制/XML），随后整个 bundle 会重新 codesign，
+  # CodeResources 中的 Info.plist 摘要也会随新签名一起重建。
+  "$PY" - "$APP/Info.plist" "$MIN_OS_VERSION" <<'PY'
+import plistlib, sys
+path, want = sys.argv[1], sys.argv[2]
+raw = open(path, "rb").read()
+fmt = plistlib.FMT_BINARY if raw.startswith(b"bplist00") else plistlib.FMT_XML
+info = plistlib.loads(raw)
+old = info.get("MinimumOSVersion", "<缺失>")
+info["MinimumOSVersion"] = want
+with open(path, "wb") as f:
+    plistlib.dump(info, f, fmt=fmt)
+print("::notice::MinimumOSVersion: %s -> %s (plist fmt=%s)"
+      % (old, want, "binary" if fmt == plistlib.FMT_BINARY else "xml"))
+PY
+
   # 主 App 的 entitlements 以「新描述文件」为基准重建：
   #   原签名里的 application-identifier / team-identifier / get-task-allow 带旧 Team，
   #   沿用会出现 ITMS-90163 或装不上；SDK 依赖但 profile 未声明的能力键才从旧签名补齐。
@@ -276,7 +306,7 @@ PY
   rm -f "$NEW"
   ( cd "$WORK/unpack" && zip -qry "$NEW" * )
   "$PY" - "$NEW" "$T/ipa-tops.txt" <<'PY'
-import sys, zipfile
+import os, sys, zipfile, plistlib
 z = zipfile.ZipFile(sys.argv[1])
 tops = sorted({n.split("/")[0] for n in z.namelist()
                if n.split("/")[0] and not n.startswith("__MACOSX")})
@@ -288,6 +318,17 @@ if z.testzip():
     sys.exit(1)
 if missing:
     print("::error::重打包丢失顶层条目: %s" % ", ".join(missing))
+    sys.exit(1)
+infos = [n for n in z.namelist()
+         if n.startswith("Payload/") and n.endswith(".app/Info.plist") and n.count("/") == 2]
+if len(infos) != 1:
+    print("::error::重打包后找不到唯一的主 App Info.plist")
+    sys.exit(1)
+want_os = os.environ.get("MIN_OS_VERSION", "15.0")
+got_os = str(plistlib.loads(z.read(infos[0])).get("MinimumOSVersion", "<缺失>"))
+print("::notice::重打包后 MinimumOSVersion = %s (要求 %s)" % (got_os, want_os))
+if got_os != want_os:
+    print("::error::MinimumOSVersion 未生效: %s != %s" % (got_os, want_os))
     sys.exit(1)
 PY
   mv "$NEW" "$IPA"

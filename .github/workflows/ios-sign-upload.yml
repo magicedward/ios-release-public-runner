@@ -61,6 +61,10 @@ on:
         required: true
         default: 'false'
         options: ['false', 'true']
+      min_os_version:
+        description: 'iOS 最低部署系统（Apple 2027-04 起要求 >= 15.0；resign 时写入主 App Info.plist）'
+        required: false
+        default: '15.0'
 
 permissions:
   contents: read
@@ -80,6 +84,7 @@ jobs:
       IPA_URL: ${{ inputs.ipa_url }}
       SIGN_MODE: ${{ inputs.sign_mode }}
       EXPECTED_BUNDLE_ID: com.jieli.bmstool
+      MIN_OS_VERSION: ${{ inputs.min_os_version }}
     steps:
       - uses: actions/checkout@v4
 
