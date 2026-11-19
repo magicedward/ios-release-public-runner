@@ -22,6 +22,10 @@ export MIN_OS_VERSION
 # 设为 'false' 可回退到云构建原值（仅用于排查 ATS 导致的网络异常）。
 ATS_STRICT="${ATS_STRICT:-true}"
 export ATS_STRICT
+# ASC 拒绝重复的 version+build 组合（ITMS-90189）。修复 ITMS-91166 后重传时，
+# 用 BUILD_NUMBER 递增 build 号；留空则沿用原包 CFBundleVersion。
+BUILD_NUMBER="${BUILD_NUMBER:-}"
+export BUILD_NUMBER
 
 cleanup() {
   rm -f "$T/cert.p12" "$T/profile.mobileprovision" "$T/ent.tmp.plist" \
@@ -205,7 +209,7 @@ PY
   # 提升最低部署系统：保留原 plist 格式（二进制/XML），随后整个 bundle 会重新 codesign，
   # CodeResources 中的 Info.plist 摘要也会随新签名一起重建。
   "$PY" - "$APP/Info.plist" "$MIN_OS_VERSION" "$ATS_STRICT" <<'PY'
-import plistlib, sys
+import os, plistlib, sys
 path, want, ats_strict = sys.argv[1], sys.argv[2], sys.argv[3]
 raw = open(path, "rb").read()
 fmt = plistlib.FMT_BINARY if raw.startswith(b"bplist00") else plistlib.FMT_XML
@@ -214,6 +218,12 @@ old = info.get("MinimumOSVersion", "<缺失>")
 info["MinimumOSVersion"] = want
 print("::notice::MinimumOSVersion: %s -> %s (plist fmt=%s)"
       % (old, want, "binary" if fmt == plistlib.FMT_BINARY else "xml"))
+build = os.environ.get("BUILD_NUMBER", "").strip()
+if build:
+    old_build = info.get("CFBundleVersion", "<缺失>")
+    info["CFBundleVersion"] = build
+    print("::notice::CFBundleVersion: %s -> %s (避开 ASC 重复 build)"
+          % (old_build, build))
 if ats_strict.lower() == "true":
     old_ats = info.get("NSAppTransportSecurity", "<缺失>")
     # 严格 ATS：不列任何例外域名，避免把微信平台域名写进白名单而被审核视为自证
@@ -336,11 +346,19 @@ if len(infos) != 1:
     print("::error::重打包后找不到唯一的主 App Info.plist")
     sys.exit(1)
 want_os = os.environ.get("MIN_OS_VERSION", "15.0")
-got_os = str(plistlib.loads(z.read(infos[0])).get("MinimumOSVersion", "<缺失>"))
+new_info = plistlib.loads(z.read(infos[0]))
+got_os = str(new_info.get("MinimumOSVersion", "<缺失>"))
 print("::notice::重打包后 MinimumOSVersion = %s (要求 %s)" % (got_os, want_os))
 if got_os != want_os:
     print("::error::MinimumOSVersion 未生效: %s != %s" % (got_os, want_os))
     sys.exit(1)
+want_build = os.environ.get("BUILD_NUMBER", "").strip()
+if want_build:
+    got_build = str(new_info.get("CFBundleVersion", "<缺失>"))
+    print("::notice::重打包后 CFBundleVersion = %s (要求 %s)" % (got_build, want_build))
+    if got_build != want_build:
+        print("::error::CFBundleVersion 未生效: %s != %s" % (got_build, want_build))
+        sys.exit(1)
 PY
   mv "$NEW" "$IPA"
 }

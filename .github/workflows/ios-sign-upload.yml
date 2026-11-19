@@ -71,6 +71,16 @@ on:
         required: true
         default: 'true'
         options: ['true', 'false']
+      sign_profile:
+        description: '重签描述文件：adhoc=真机安装（含 UDID）；distribution=App Store 分发（修复 ITMS-91166 后用）'
+        type: choice
+        required: true
+        default: 'adhoc'
+        options: ['adhoc', 'distribution']
+      build_number:
+        description: '重签时覆写 CFBundleVersion（ASC 不允许重复 version+build；留空沿用原包）'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -92,6 +102,8 @@ jobs:
       EXPECTED_BUNDLE_ID: com.jieli.bmstool
       MIN_OS_VERSION: ${{ inputs.min_os_version }}
       ATS_STRICT: ${{ inputs.ats_strict }}
+      BUILD_NUMBER: ${{ inputs.build_number }}
+      SIGN_PROFILE: ${{ inputs.sign_profile }}
     steps:
       - uses: actions/checkout@v4
 
@@ -141,7 +153,7 @@ jobs:
           # resign 模式才需要下面 4 项；verify 模式留空即可
           P12_BASE64: ${{ secrets.P12_BASE64 }}
           P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
-          MOBILEPROVISION_BASE64: ${{ secrets.MOBILEPROVISION_BASE64 }}
+          MOBILEPROVISION_BASE64: ${{ inputs.sign_profile == 'distribution' && secrets.MOBILEPROVISION_DIST_BASE64 || secrets.MOBILEPROVISION_BASE64 }}
           CERT_NAME: ${{ secrets.CERT_NAME }}
         run: bash scripts/ios-release/ci-sign.sh work/app.ipa "$SIGN_MODE"
 
@@ -180,6 +192,8 @@ jobs:
             echo "| --- | --- |"
             echo "| IPA 来源 | \`$IPA_SOURCE\` / \`$RELEASE_TAG\` |"
             echo "| 签名模式 | \`$SIGN_MODE\` |"
+            echo "| 描述文件 | \`$SIGN_PROFILE\` |"
+            echo "| Build 号覆写 | \`${BUILD_NUMBER:-（沿用原包）}\` |"
             echo "| Runner | \`${{ runner.os }}\` |"
             echo "| 上传 | \`$UPLOAD_MODE\` / \`${{ inputs.backend }}\` |"
           } >> "$GITHUB_STEP_SUMMARY"
