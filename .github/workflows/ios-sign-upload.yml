@@ -65,6 +65,12 @@ on:
         description: 'iOS 最低部署系统（Apple 2027-04 起要求 >= 15.0；resign 时写入主 App Info.plist）'
         required: false
         default: '15.0'
+      ats_strict:
+        description: '收紧 ATS（2.5.19 整改：关闭 NSAllowsArbitraryLoads）；排查网络问题时可设 false'
+        type: choice
+        required: true
+        default: 'true'
+        options: ['true', 'false']
 
 permissions:
   contents: read
@@ -85,6 +91,7 @@ jobs:
       SIGN_MODE: ${{ inputs.sign_mode }}
       EXPECTED_BUNDLE_ID: com.jieli.bmstool
       MIN_OS_VERSION: ${{ inputs.min_os_version }}
+      ATS_STRICT: ${{ inputs.ats_strict }}
     steps:
       - uses: actions/checkout@v4
 

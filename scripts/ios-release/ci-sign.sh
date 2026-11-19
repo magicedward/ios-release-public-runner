@@ -17,6 +17,11 @@ export EXPECTED_BUNDLE_ID
 # 故在 resign 时把主 App Info.plist 的 MinimumOSVersion 提升到该值，再整体重新签名。
 MIN_OS_VERSION="${MIN_OS_VERSION:-15.0}"
 export MIN_OS_VERSION
+# Guideline 2.5.19 整改：云构建默认放开 ATS (NSAllowsArbitraryLoads=true)。
+# resign 时收紧为严格策略，避免「与外部平台服务器的不受控加密通信」这一加重项。
+# 设为 'false' 可回退到云构建原值（仅用于排查 ATS 导致的网络异常）。
+ATS_STRICT="${ATS_STRICT:-true}"
+export ATS_STRICT
 
 cleanup() {
   rm -f "$T/cert.p12" "$T/profile.mobileprovision" "$T/ent.tmp.plist" \
@@ -199,18 +204,24 @@ PY
 
   # 提升最低部署系统：保留原 plist 格式（二进制/XML），随后整个 bundle 会重新 codesign，
   # CodeResources 中的 Info.plist 摘要也会随新签名一起重建。
-  "$PY" - "$APP/Info.plist" "$MIN_OS_VERSION" <<'PY'
+  "$PY" - "$APP/Info.plist" "$MIN_OS_VERSION" "$ATS_STRICT" <<'PY'
 import plistlib, sys
-path, want = sys.argv[1], sys.argv[2]
+path, want, ats_strict = sys.argv[1], sys.argv[2], sys.argv[3]
 raw = open(path, "rb").read()
 fmt = plistlib.FMT_BINARY if raw.startswith(b"bplist00") else plistlib.FMT_XML
 info = plistlib.loads(raw)
 old = info.get("MinimumOSVersion", "<缺失>")
 info["MinimumOSVersion"] = want
-with open(path, "wb") as f:
-    plistlib.dump(info, f, fmt=fmt)
 print("::notice::MinimumOSVersion: %s -> %s (plist fmt=%s)"
       % (old, want, "binary" if fmt == plistlib.FMT_BINARY else "xml"))
+if ats_strict.lower() == "true":
+    old_ats = info.get("NSAppTransportSecurity", "<缺失>")
+    # 严格 ATS：不列任何例外域名，避免把微信平台域名写进白名单而被审核视为自证
+    info["NSAppTransportSecurity"] = {"NSAllowsArbitraryLoads": False}
+    print("::notice::NSAppTransportSecurity: %s -> NSAllowsArbitraryLoads=false (2.5.19)"
+          % (old_ats if isinstance(old_ats, str) else str(old_ats)))
+with open(path, "wb") as f:
+    plistlib.dump(info, f, fmt=fmt)
 PY
 
   # 主 App 的 entitlements 以「新描述文件」为基准重建：
